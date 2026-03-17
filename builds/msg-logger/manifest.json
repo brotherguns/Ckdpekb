@@ -1,7 +1,1 @@
-{
-    "name": "Message Logger",
-    "description": "Logs deleted and edited messages with full before/after diffs",
-    "authors": [{ "name": "brotherguns" }],
-    "main": "index.js",
-    "hash": "3"
-}
+{"name":"Message Logger","description":"Shows deleted messages in chat with a DELETED badge and edit history inline","authors":[{"name":"brotherguns"}],"main":"index.js","hash":"4"}

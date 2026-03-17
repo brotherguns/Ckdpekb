@@ -1,37 +1,26 @@
 (function() {
+
+    // ── State ────────────────────────────────────────────────────────────
+    var ghostDeleted  = Object.create(null); // id -> {content, authorName, channelId, time}
+    var editHistories = Object.create(null); // id -> [{content, time}, ...]
+    var msgCache      = Object.create(null); // id -> {content, authorName, channelId, guildId}
+    var cacheKeys     = [];
+    var MAX_CACHE     = 2000;
     var _removeIntercept = null;
-    var _storage = null;
-    var msgCache  = Object.create(null);
-    var cacheKeys = [];
-    var MAX_CACHE = 1000;
-    var MAX_LOGS  = 500;
+    var _unpatches    = [];
 
-    // ── Utils ─────────────────────────────────────────────────────────────
+    // ── Cache ────────────────────────────────────────────────────────────
 
-    function pad2(n) { return String(n).padStart(2, "0"); }
-
-    function fmtTime(ms) {
-        var d = new Date(ms);
-        return (d.getMonth()+1)+"/"+d.getDate()
-            +" "+pad2(d.getHours())+":"+pad2(d.getMinutes())+":"+pad2(d.getSeconds());
-    }
-
-    function fmtRelative(ms) {
-        var diff = Date.now() - ms;
-        if (diff < 60000)    return Math.floor(diff/1000)+"s ago";
-        if (diff < 3600000)  return Math.floor(diff/60000)+"m ago";
-        if (diff < 86400000) return Math.floor(diff/3600000)+"h ago";
-        return Math.floor(diff/86400000)+"d ago";
-    }
-
-    // ── Cache ─────────────────────────────────────────────────────────────
-
-    function cacheSet(msg) {
-        if (!msg || !msg.id || !msg.content) return;
-        if (msgCache[msg.id]) { msgCache[msg.id].content = msg.content; return; }
+    function cacheMsg(msg) {
+        if (!msg || !msg.id) return;
+        var existing = msgCache[msg.id];
+        if (existing) {
+            if (msg.content) existing.content = msg.content;
+            return;
+        }
         msgCache[msg.id] = {
-            content:    msg.content,
-            authorId:   msg.author ? (msg.author.id || "?") : "?",
+            content:    msg.content    || "",
+            authorId:   msg.author ? (msg.author.id   || "?") : "?",
             authorName: msg.author ? (msg.author.global_name || msg.author.username || "Unknown") : "Unknown",
             channelId:  msg.channel_id || "?",
             guildId:    msg.guild_id   || null,
@@ -40,287 +29,245 @@
         while (cacheKeys.length > MAX_CACHE) { delete msgCache[cacheKeys.shift()]; }
     }
 
-    // ── Log storage ───────────────────────────────────────────────────────
-
-    function getLogs() {
-        if (!_storage) return [];
-        if (!Array.isArray(_storage.logs)) _storage.logs = [];
-        return _storage.logs;
-    }
-
-    function addLog(entry) {
-        var logs = getLogs();
-        logs.unshift(entry);
-        if (logs.length > MAX_LOGS) logs.splice(MAX_LOGS);
-    }
-
     // ── Flux intercept ────────────────────────────────────────────────────
+    // Raw _interceptors cb: return true to BLOCK the dispatch
 
-    function onFluxEvent(payload) {
+    function onFluxRaw(payload) {
         try {
-            switch (payload.type) {
-                case "MESSAGE_CREATE":
-                    cacheSet(payload.message);
-                    break;
+            if (payload.type === "MESSAGE_CREATE") {
+                cacheMsg(payload.message);
+            }
 
-                case "MESSAGE_UPDATE": {
-                    var msg = payload.message;
-                    if (!msg || !msg.id || !msg.content) break;
-                    var cached = msgCache[msg.id];
-                    if (cached && cached.content && cached.content !== msg.content) {
-                        addLog({
-                            type: "edit",
-                            msgId: msg.id,
-                            channelId: msg.channel_id || cached.channelId,
-                            guildId:   msg.guild_id   || cached.guildId,
-                            authorId:   cached.authorId,
-                            authorName: cached.authorName,
-                            content:       cached.content,
-                            editedContent: msg.content,
-                            time: Date.now(),
-                        });
-                    }
-                    cacheSet(msg);
-                    break;
+            else if (payload.type === "MESSAGE_UPDATE") {
+                var msg = payload.message;
+                if (!msg || !msg.id) return;
+                var cached = msgCache[msg.id];
+                var oldContent = cached ? cached.content : null;
+                var newContent = msg.content;
+                if (oldContent && newContent && oldContent !== newContent) {
+                    if (!editHistories[msg.id]) editHistories[msg.id] = [];
+                    editHistories[msg.id].push({ content: oldContent, time: Date.now() });
+                    if (editHistories[msg.id].length > 10) editHistories[msg.id].shift();
                 }
+                cacheMsg(msg);
+            }
 
-                case "MESSAGE_DELETE": {
-                    var c = msgCache[payload.id];
-                    if (!c || !c.content) break;
-                    addLog({
-                        type: "delete",
-                        msgId:      payload.id,
-                        channelId:  payload.channelId || c.channelId,
-                        guildId:    payload.guildId   || c.guildId,
-                        authorId:   c.authorId,
-                        authorName: c.authorName,
+            else if (payload.type === "MESSAGE_DELETE") {
+                var id = payload.id;
+                var c  = msgCache[id];
+                if (c && c.content) {
+                    ghostDeleted[id] = {
                         content:    c.content,
-                        time: Date.now(),
-                    });
-                    delete msgCache[payload.id];
-                    break;
-                }
-
-                case "MESSAGE_DELETE_BULK": {
-                    var ids = payload.ids || [];
-                    for (var i = 0; i < ids.length; i++) {
-                        var c2 = msgCache[ids[i]];
-                        if (!c2 || !c2.content) continue;
-                        addLog({
-                            type: "delete",
-                            msgId:      ids[i],
-                            channelId:  payload.channelId || c2.channelId,
-                            guildId:    c2.guildId,
-                            authorId:   c2.authorId,
-                            authorName: c2.authorName,
-                            content:    c2.content,
-                            bulk: true,
-                            time: Date.now(),
-                        });
-                        delete msgCache[ids[i]];
-                    }
-                    break;
+                        authorName: c.authorName,
+                        channelId:  c.channelId,
+                        guildId:    c.guildId,
+                        time:       Date.now(),
+                    };
+                    // Block the delete so message stays in the channel
+                    return true;
                 }
             }
-        } catch (e) {
-            // swallow per-event errors so we never crash discord
-        }
+
+            else if (payload.type === "MESSAGE_DELETE_BULK") {
+                var ids = payload.ids || [];
+                var anyGhosted = false;
+                for (var i = 0; i < ids.length; i++) {
+                    var c2 = msgCache[ids[i]];
+                    if (c2 && c2.content) {
+                        ghostDeleted[ids[i]] = {
+                            content:    c2.content,
+                            authorName: c2.authorName,
+                            channelId:  c2.channelId,
+                            guildId:    c2.guildId,
+                            bulk:       true,
+                            time:       Date.now(),
+                        };
+                        anyGhosted = true;
+                    }
+                }
+                // Block bulk delete for any ghosted message
+                if (anyGhosted) return true;
+            }
+        } catch(e) {}
     }
 
-    // ── Settings UI ───────────────────────────────────────────────────────
+    // ── Patch message component ───────────────────────────────────────────
+    // We patch whatever renders message content to:
+    //  1. Overlay a red tint + "DELETED" badge on ghost-deleted messages
+    //  2. Show an edit history expander under edited messages
 
-    function SettingsComponent() {
-        var R  = vendetta.metro.common.React;
-        var RN = vendetta.metro.common.ReactNative;
-        var h  = R.createElement;
+    function patchMessages() {
+        var RN   = vendetta.metro.common.ReactNative;
+        var R    = vendetta.metro.common.React;
+        var h    = R.createElement;
 
-        var tabS = R.useState(0);   var tab = tabS[0]; var setTab = tabS[1];
-        var tickS = R.useReducer(function(n){return n+1;},0); var tick = tickS[1];
+        // Try multiple known prop combos Discord has used for the message content wrapper
+        var propCombos = [
+            ["renderContent", "renderEmbeds"],
+            ["renderContent", "renderAttachments"],
+            ["getMessageId",  "renderContent"],
+            ["message",       "renderContent"],
+        ];
 
-        var tokens = vendetta.metro.findByProps("unsafe_rawColors","colors");
-        var colors = tokens && tokens.colors;
-        var C = {
-            text:      (colors && colors.TEXT_NORMAL)            || "#dcddde",
-            muted:     (colors && colors.TEXT_MUTED)             || "#72767d",
-            bg:        (colors && colors.BACKGROUND_SECONDARY)   || "#2f3136",
-            bgDeep:    (colors && colors.BACKGROUND_TERTIARY)    || "#202225",
-            bgPrimary: (colors && colors.BACKGROUND_PRIMARY)     || "#36393f",
-            brand: "#5865f2",
-            red:   "#ed4245",
-            gold:  "#fee75c",
-            goldD: "#b8960c",
-        };
-
-        var logs     = getLogs();
-        var delLogs  = logs.filter(function(l){ return l.type === "delete"; });
-        var editLogs = logs.filter(function(l){ return l.type === "edit";   });
-        var filtered = tab === 0 ? logs : tab === 1 ? delLogs : editLogs;
-
-        function doClear() {
-            if (_storage) _storage.logs = [];
-            tick();
+        var mod = null;
+        var renderKey = null;
+        for (var i = 0; i < propCombos.length; i++) {
+            var candidate = vendetta.metro.findByProps.apply(null, propCombos[i]);
+            if (candidate) {
+                // find which exported key is the component/function
+                var keys = Object.keys(candidate);
+                for (var j = 0; j < keys.length; j++) {
+                    if (typeof candidate[keys[j]] === "function" && /message|content|chat/i.test(keys[j])) {
+                        mod = candidate; renderKey = keys[j]; break;
+                    }
+                }
+                if (mod) break;
+            }
         }
 
-        function doCopy(entry) {
-            var text = entry.type === "edit"
-                ? "[BEFORE] " + entry.content + "\n[AFTER]  " + entry.editedContent
-                : entry.content;
-            try { vendetta.metro.common.clipboard.setString(text); } catch(e) {}
-            try { vendetta.ui.toasts.showToast("Copied!"); } catch(e) {}
+        // Fallback: find by display name
+        if (!mod) {
+            var byName = vendetta.metro.findByDisplayName("MessageContent");
+            if (byName && typeof byName === "function") {
+                mod = { MessageContent: byName }; renderKey = "MessageContent";
+            }
         }
 
-        // tab bar
-        var tabBar = h(RN.View, { style: { flexDirection:"row", marginHorizontal:12, marginTop:12, marginBottom:8, backgroundColor:C.bgDeep, borderRadius:10, padding:3 } },
-            [
-                ["All",     logs.length,      C.brand],
-                ["Deleted", delLogs.length,   C.red  ],
-                ["Edited",  editLogs.length,  C.gold ],
-            ].map(function(row, i) {
-                var label = row[0], count = row[1], accent = row[2];
-                var active = tab === i;
-                return h(RN.TouchableOpacity, {
-                    key: String(i),
-                    onPress: function() { setTab(i); },
-                    activeOpacity: 0.8,
-                    style: {
-                        flex: 1, alignItems: "center", paddingVertical: 9, borderRadius: 8,
-                        backgroundColor: active ? accent + "33" : "transparent",
-                        borderWidth: (active && i !== 0) ? 1 : 0,
-                        borderColor: active ? accent + "66" : "transparent",
+        if (!mod || !renderKey) return false;
+
+        var unpatch = vendetta.patcher.after(renderKey, mod, function(args, ret) {
+            // Extract message id from args or the first arg's props
+            var msgId = null;
+            try {
+                var firstArg = args[0];
+                msgId = (firstArg && (firstArg.messageId || (firstArg.message && firstArg.message.id) || firstArg.id));
+            } catch(e) {}
+            if (!msgId) return;
+
+            var tokens = vendetta.metro.findByProps("unsafe_rawColors","colors");
+            var colors = tokens && tokens.colors;
+            var C = {
+                red:    "#ed4245",
+                gold:   "#fee75c",
+                goldD:  "#b8960c",
+                muted:  (colors && colors.TEXT_MUTED) || "#72767d",
+                text:   (colors && colors.TEXT_NORMAL)|| "#dcddde",
+                bgDeep: (colors && colors.BACKGROUND_TERTIARY) || "#202225",
+            };
+
+            var overlays = [];
+
+            // Deleted ghost overlay
+            if (ghostDeleted[msgId]) {
+                overlays.push(
+                    h(RN.View, {
+                        key: "del-badge",
+                        style: { flexDirection:"row", alignItems:"center", marginTop:4,
+                                 backgroundColor: C.red+"18", borderRadius:4,
+                                 paddingHorizontal:6, paddingVertical:2,
+                                 borderLeftWidth:2, borderLeftColor:C.red+"88",
+                                 alignSelf:"flex-start" }
                     },
-                },
-                    h(RN.Text, { style: { color: active ? (i===2 ? C.goldD : "#fff") : C.muted, fontWeight: active ? "700" : "500", fontSize: 13 } }, label),
-                    h(RN.View, { style: { marginTop:2, backgroundColor: active ? "#ffffff22" : C.bgPrimary, borderRadius:10, paddingHorizontal:7, paddingVertical:1 } },
-                        h(RN.Text, { style: { color: active ? (i===2 ? C.goldD : "#fff") : C.muted, fontSize:11, fontWeight:"600" } }, String(count))
+                        h(RN.Text, { style: { color:C.red, fontSize:11, fontWeight:"700", letterSpacing:0.5 } }, "🗑 DELETED")
                     )
                 );
-            })
-        );
+            }
 
-        // clear button
-        var clearBtn = filtered.length > 0
-            ? h(RN.TouchableOpacity, {
-                onPress: doClear, activeOpacity: 0.75,
-                style: { marginHorizontal:12, marginBottom:10, backgroundColor:C.red+"18", borderRadius:8, paddingVertical:9, alignItems:"center", borderWidth:1, borderColor:C.red+"44" },
-              },
-                h(RN.Text, { style: { color: C.red, fontWeight:"600", fontSize:13 } },
-                    "Clear " + filtered.length + " log" + (filtered.length !== 1 ? "s" : ""))
-              )
-            : null;
-
-        // empty state
-        var emptyView = h(RN.View, { style: { alignItems:"center", paddingTop:80 } },
-            h(RN.Text, { style: { fontSize:38, marginBottom:12 } }, tab===1 ? "🗑️" : tab===2 ? "✏️" : "👁️"),
-            h(RN.Text, { style: { color:C.muted, fontSize:16, fontWeight:"600" } }, "Nothing logged yet"),
-            h(RN.Text, { style: { color:C.muted, fontSize:13, marginTop:6, textAlign:"center", paddingHorizontal:30 } },
-                tab===1 ? "Deleted messages will show here."
-                : tab===2 ? "Edited messages will show here."
-                : "Messages get cached as you browse — then deletes/edits show up here."
-            )
-        );
-
-        // entry renderer
-        function renderEntry(entry, idx) {
-            var isDel  = entry.type === "delete";
-            var accent = isDel ? C.red : C.gold;
-            var tag    = isDel ? (entry.bulk ? "BULK DEL" : "DELETED") : "EDITED";
-            return h(RN.TouchableOpacity, {
-                key: entry.msgId + "_" + idx,
-                onLongPress: function() { doCopy(entry); },
-                activeOpacity: 0.85,
-                style: { backgroundColor:C.bg, borderRadius:10, marginBottom:8, overflow:"hidden" },
-            },
-                h(RN.View, { style: { height:3, backgroundColor:accent } }),
-                h(RN.View, { style: { padding:12 } },
-                    // header
-                    h(RN.View, { style: { flexDirection:"row", alignItems:"center", marginBottom:8 } },
-                        h(RN.View, { style: { backgroundColor:accent+"25", borderRadius:5, paddingHorizontal:7, paddingVertical:3, marginRight:8, borderWidth:1, borderColor:accent+"55" } },
-                            h(RN.Text, { style: { color:accent, fontSize:10, fontWeight:"800", letterSpacing:0.8 } }, tag)
-                        ),
-                        h(RN.Text, { style: { color:C.text, fontSize:14, fontWeight:"700", flex:1 }, numberOfLines:1 }, entry.authorName || "Unknown"),
-                        h(RN.View, { style: { alignItems:"flex-end" } },
-                            h(RN.Text, { style: { color:C.muted, fontSize:11 } }, fmtTime(entry.time)),
-                            h(RN.Text, { style: { color:C.muted, fontSize:10 } }, fmtRelative(entry.time))
-                        )
-                    ),
-                    // channel info
-                    h(RN.Text, { style: { color:C.muted, fontSize:11, marginBottom:10 } },
-                        "#" + (entry.channelId||"?") + (entry.guildId ? "  •  guild " + entry.guildId : "  •  DM")
-                    ),
-                    // content
-                    isDel
-                        ? h(RN.View, { style: { backgroundColor:C.bgDeep, borderRadius:8, padding:10, borderLeftWidth:2, borderLeftColor:C.red+"88" } },
-                            h(RN.Text, { style: { color:C.text, fontSize:14, lineHeight:20 } }, entry.content || "(empty)")
-                          )
-                        : h(RN.View, null,
-                            h(RN.View, { style: { backgroundColor:C.bgDeep, borderRadius:8, padding:10, marginBottom:6, borderLeftWidth:2, borderLeftColor:C.red+"88" } },
-                                h(RN.Text, { style: { color:C.red, fontSize:10, fontWeight:"700", marginBottom:4 } }, "BEFORE"),
-                                h(RN.Text, { style: { color:C.text, fontSize:14, lineHeight:20 } }, entry.content || "(empty)")
+            // Edit history expander
+            if (editHistories[msgId] && editHistories[msgId].length > 0) {
+                var ExpandedEdits = (function() {
+                    var localMsgId = msgId;
+                    return function() {
+                        var expanded = R.useState(false);
+                        var open = expanded[0]; var setOpen = expanded[1];
+                        var history = editHistories[localMsgId] || [];
+                        return h(RN.View, { style: { marginTop:4 } },
+                            h(RN.TouchableOpacity, {
+                                onPress: function() { setOpen(!open); },
+                                activeOpacity: 0.7,
+                                style: { flexDirection:"row", alignItems:"center",
+                                         alignSelf:"flex-start", paddingVertical:2,
+                                         paddingHorizontal:6, borderRadius:4,
+                                         backgroundColor: C.gold+"18",
+                                         borderLeftWidth:2, borderLeftColor:C.gold+"88" }
+                            },
+                                h(RN.Text, { style:{ color:C.goldD, fontSize:11, fontWeight:"700" } },
+                                    (open ? "▲" : "▼") + " " + history.length + " edit" + (history.length!==1?"s":"") + " — tap to " + (open?"hide":"show"))
                             ),
-                            h(RN.View, { style: { backgroundColor:C.bgDeep, borderRadius:8, padding:10, borderLeftWidth:2, borderLeftColor:C.gold+"88" } },
-                                h(RN.Text, { style: { color:C.goldD, fontSize:10, fontWeight:"700", marginBottom:4 } }, "AFTER"),
-                                h(RN.Text, { style: { color:C.text, fontSize:14, lineHeight:20 } }, entry.editedContent || "(empty)")
+                            open && h(RN.View, { style: { marginTop:4 } },
+                                history.slice().reverse().map(function(edit, idx) {
+                                    return h(RN.View, {
+                                        key: String(idx),
+                                        style: { backgroundColor:C.bgDeep, borderRadius:6, padding:8,
+                                                 marginBottom:4, borderLeftWidth:2, borderLeftColor:C.gold+"88" }
+                                    },
+                                        h(RN.Text, { style:{ color:C.muted, fontSize:10, marginBottom:3 } },
+                                            "version " + (history.length - idx) + "  •  " + new Date(edit.time).toLocaleTimeString()),
+                                        h(RN.Text, { style:{ color:C.text, fontSize:13, lineHeight:18 } }, edit.content)
+                                    );
+                                })
                             )
-                          ),
-                    h(RN.Text, { style: { color:C.muted, fontSize:10, marginTop:8, textAlign:"right" } }, "long press to copy")
-                )
-            );
-        }
+                        );
+                    };
+                })();
 
-        return h(RN.View, { style: { flex:1, backgroundColor:C.bgPrimary } },
-            tabBar,
-            clearBtn,
-            h(RN.ScrollView, {
-                style: { flex:1, paddingHorizontal:12 },
-                contentContainerStyle: { paddingBottom:24 },
-                showsVerticalScrollIndicator: false,
-            },
-                filtered.length === 0 ? emptyView : filtered.map(renderEntry)
-            )
-        );
+                overlays.push(h(ExpandedEdits, { key: "edits" }));
+            }
+
+            if (!overlays.length) return;
+
+            // Wrap the original return value + our overlays in a fragment
+            if (!ret) return h(RN.View, null, overlays);
+            return h(RN.View, null, ret, overlays);
+        });
+
+        _unpatches.push(unpatch);
+        return true;
     }
 
     // ── Plugin lifecycle ──────────────────────────────────────────────────
 
     return {
         onLoad: function() {
-            // Init storage
-            try {
-                _storage = vendetta.storage.wrapSync(
-                    vendetta.storage.createStorage(
-                        vendetta.storage.createMMKVBackend("msg-logger-store")
-                    )
-                );
-            } catch(e) {
-                _storage = null;
-            }
-
-            // Hook Flux using _interceptors directly (same as Kettu internals)
+            // Flux intercept via raw _interceptors
             var FD = vendetta.metro.findByProps("_interceptors");
             if (FD && Array.isArray(FD._interceptors)) {
-                FD._interceptors.push(onFluxEvent);
+                FD._interceptors.push(onFluxRaw);
                 _removeIntercept = function() {
-                    FD._interceptors = FD._interceptors.filter(function(fn) { return fn !== onFluxEvent; });
+                    FD._interceptors = FD._interceptors.filter(function(fn){ return fn !== onFluxRaw; });
                 };
-            } else {
-                // fallback: try subscribe/unsubscribe
-                try {
-                    var events = ["MESSAGE_CREATE","MESSAGE_UPDATE","MESSAGE_DELETE","MESSAGE_DELETE_BULK"];
-                    events.forEach(function(e) { FD.subscribe(e, onFluxEvent); });
-                    _removeIntercept = function() {
-                        events.forEach(function(e) { try { FD.unsubscribe(e, onFluxEvent); } catch(_) {} });
-                    };
-                } catch(_) {}
             }
+
+            // Patch message renderer
+            patchMessages();
         },
 
         onUnload: function() {
-            if (_removeIntercept) { try { _removeIntercept(); } catch(e) {} _removeIntercept = null; }
-            msgCache  = Object.create(null);
-            cacheKeys = [];
-            _storage  = null;
+            _unpatches.forEach(function(u){ try { u && u(); } catch(e){} });
+            _unpatches = [];
+            if (_removeIntercept) { try { _removeIntercept(); } catch(e){} _removeIntercept = null; }
+            ghostDeleted  = Object.create(null);
+            editHistories = Object.create(null);
+            msgCache      = Object.create(null);
+            cacheKeys     = [];
         },
 
-        settings: SettingsComponent,
+        settings: function() {
+            var R  = vendetta.metro.common.React;
+            var RN = vendetta.metro.common.ReactNative;
+            var h  = R.createElement;
+            var tokens = vendetta.metro.findByProps("unsafe_rawColors","colors");
+            var C = { muted: (tokens&&tokens.colors&&tokens.colors.TEXT_MUTED)||"#72767d", text: (tokens&&tokens.colors&&tokens.colors.TEXT_NORMAL)||"#dcddde" };
+            var ghostCount = Object.keys(ghostDeleted).length;
+            var editCount  = Object.keys(editHistories).length;
+            return h(RN.View, { style:{ padding:20 } },
+                h(RN.Text, { style:{ color:C.text, fontSize:18, fontWeight:"700", marginBottom:8 } }, "Message Logger"),
+                h(RN.Text, { style:{ color:C.muted, fontSize:14, marginBottom:4 } }, "Deleted messages stay visible in chat with a 🗑 DELETED badge."),
+                h(RN.Text, { style:{ color:C.muted, fontSize:14, marginBottom:16 } }, "Edited messages show a tap-to-expand edit history under them."),
+                h(RN.Text, { style:{ color:C.muted, fontSize:13 } }, "Currently tracking:"),
+                h(RN.Text, { style:{ color:"#ed4245", fontSize:13, marginTop:4 } }, "  🗑  " + ghostCount + " ghost-deleted message" + (ghostCount!==1?"s":"")),
+                h(RN.Text, { style:{ color:"#fee75c", fontSize:13, marginTop:4 } }, "  ✏️  " + editCount + " message" + (editCount!==1?"s":"") + " with edit history")
+            );
+        },
     };
 })()
