@@ -1,0 +1,9 @@
+{
+    "$meta": {
+        "name": "brotherguns plugins",
+        "description": "Personal Kettu/Bunny plugin repo"
+    },
+    "msg-logger": {
+        "version": "1.0.0"
+    }
+}
