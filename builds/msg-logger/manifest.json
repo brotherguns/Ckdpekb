@@ -1,0 +1,7 @@
+{
+    "name": "Message Logger",
+    "description": "Logs deleted and edited messages with full before/after diffs",
+    "authors": [{ "name": "brotherguns" }],
+    "main": "index.js",
+    "hash": "1"
+}
