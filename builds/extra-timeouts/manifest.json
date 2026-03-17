@@ -1,0 +1,12 @@
+{
+    "id": "msg-logger",
+    "version": "1.0.0",
+    "type": "plugin",
+    "spec": 3,
+    "main": "index.js",
+    "display": {
+        "name": "Message Logger",
+        "description": "Logs deleted and edited messages with full before/after diffs",
+        "authors": [{ "name": "brotherguns" }]
+    }
+}
