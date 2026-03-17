@@ -182,6 +182,7 @@ function SettingsComponent() {
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 
+var module = { exports: {} };
 module.exports = {
     onLoad: function() {
         _storage = vendetta.storage.wrapSync(
